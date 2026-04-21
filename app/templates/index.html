@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Circle Tiler • FastAPI</title>
+  <style>
+    :root { --gap: 12px; --ring: #07f; }
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji'; margin: 0; padding: 24px; line-height: 1.4; }
+    h1 { margin: 0 0 12px; }
+    .card { max-width: 960px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 16px; padding: 20px; box-shadow: 0 2px 12px rgba(0,0,0,0.05); }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); }
+    .row > div { background: #fafafa; border: 1px solid #eee; border-radius: 12px; padding: 12px; }
+    .controls { display: grid; gap: 8px; align-items: center; grid-template-columns: 140px 1fr; }
+    label { color: #222; font-weight: 600; }
+    input[type="number"]{ padding: 8px; width: 120px; }
+    input[type="range"] { width: 100%; }
+    .btn { display: inline-block; padding: 10px 14px; border-radius: 10px; background: black; color: white; border: none; cursor: pointer; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    canvas { width: 100%; height: auto; border-radius: 12px; background: #f5f5f5; touch-action: none; }
+    .hint { font-size: 13px; color: #444; }
+    .error { padding: 10px; background: #fee2e2; color: #7f1d1d; border: 1px solid #fecaca; border-radius: 10px; margin-bottom: 12px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Circle Tiler</h1>
+    <p class="hint">Upload an image, position it under the circular mask, pick your circle diameter in millimeters, then generate an A4 PDF tiled with your circle.</p>
+
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+
+    <div class="row">
+      <div>
+        <div class="controls" style="margin-bottom:12px;">
+          <label for="file">1) Image</label>
+          <input id="file" type="file" accept="image/*"/>
+          <label for="diam">2) Diameter (mm)</label>
+          <input id="diam" type="number" min="1" step="0.1" value="20">
+          <label for="zoom">Zoom</label>
+          <input id="zoom" type="range" min="0.1" max="5" step="0.01" value="1">
+        </div>
+        <canvas id="viewport" width="700" height="700"></canvas>
+        <p class="hint">Tip: drag to move • scroll/slider to zoom • the bright circle is your crop.</p>
+      </div>
+      <div>
+        <form id="form" method="post" action="/generate">
+          <input type="hidden" name="image_data" id="image_data">
+          <input type="hidden" name="diameter_mm" id="diameter_mm">
+          <button class="btn" id="go" type="submit" disabled>Crop &amp; Download PDF</button>
+        </form>
+        <div style="margin-top:12px;">
+          <p class="hint">Cropping is done locally in your browser; the transparent PNG of your circular crop is sent to the server to build the A4 PDF.</p>
+          <ul class="hint">
+            <li>The crop export size is based on your chosen mm diameter at ~300 dpi for print quality (capped between 128–4096 px).</li>
+            <li>A4: 210×297 mm; the app tiles circles to fill the page without margins.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const fileInput = document.getElementById('file');
+  const zoomInput = document.getElementById('zoom');
+  const diamInput = document.getElementById('diam');
+  const canvas = document.getElementById('viewport');
+  const ctx = canvas.getContext('2d');
+  const goBtn = document.getElementById('go');
+  const form = document.getElementById('form');
+  const imageDataField = document.getElementById('image_data');
+  const diameterField = document.getElementById('diameter_mm');
+
+  let img = null;
+  let imageBitmap = null;
+  let scale = 1;
+  let offset = { x: 0, y: 0 };
+  let dragging = false;
+  let prev = { x: 0, y: 0 };
+
+  const DPR = window.devicePixelRatio || 1;
+  // upscale canvas for crispness
+  function fitCanvas() {
+    const r = canvas.getBoundingClientRect();
+    const w = Math.round(r.width * DPR);
+    const h = Math.round(w); // keep it square
+    canvas.width = w;
+    canvas.height = h;
+  }
+  fitCanvas();
+  window.addEventListener('resize', fitCanvas);
+
+  function mmToIn(mm){ return mm / 25.4; }
+  function clamp(v, min, max){ return Math.max(min, Math.min(max, v)); }
+
+  async function loadFile(file) {
+    if (!file) return;
+    const blobURL = URL.createObjectURL(file);
+    imageBitmap = await createImageBitmap(file);
+    img = new Image();
+    img.src = blobURL;
+    img.onload = () => {
+      // Reset view to fit image within the circle
+      resetView();
+      goBtn.disabled = false;
+      draw();
+    };
+  }
+
+  function resetView() {
+    if (!img) return;
+    // initial: center image, scale to fit shortest side to canvas size
+    const cw = canvas.width, ch = canvas.height;
+    const iw = img.naturalWidth, ih = img.naturalHeight;
+    const s = Math.max(cw / iw, ch / ih); // fill
+    scale = s * 0.9; // leave some margins
+    offset.x = (cw - iw * scale) / 2;
+    offset.y = (ch - ih * scale) / 2;
+    zoomInput.value = String((scale / s) * 1.0); // just keep default relation
+  }
+
+  function draw() {
+    if (!img) { 
+      ctx.clearRect(0,0,canvas.width, canvas.height);
+      ctx.fillStyle = '#f5f5f5';
+      ctx.fillRect(0,0,canvas.width, canvas.height);
+      return;
+    }
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0,0,w,h);
+
+    // draw image
+    ctx.save();
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, offset.x, offset.y, img.naturalWidth * scale, img.naturalHeight * scale);
+    ctx.restore();
+
+    // circular overlay (mask preview)
+    const radius = Math.min(w,h) * 0.45; // 90% of canvas size
+    const cx = w/2, cy = h/2;
+
+    // dim outside
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath();
+    ctx.rect(0,0,w,h);
+    ctx.arc(cx, cy, radius, 0, Math.PI*2, true);
+    ctx.closePath();
+    ctx.fill('evenodd');
+    ctx.restore();
+
+    // ring
+    ctx.save();
+    ctx.lineWidth = Math.max(2, w * 0.004);
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--ring') || '#07f';
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI*2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  canvas.addEventListener('mousedown', (e) => {
+    dragging = true;
+    prev.x = e.clientX;
+    prev.y = e.clientY;
+  });
+  window.addEventListener('mouseup', () => dragging = false);
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging || !img) return;
+    const dx = (e.clientX - prev.x) * DPR;
+    const dy = (e.clientY - prev.y) * DPR;
+    offset.x += dx;
+    offset.y += dy;
+    prev.x = e.clientX;
+    prev.y = e.clientY;
+    draw();
+  });
+
+  // touch support
+  canvas.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 1) {
+      dragging = true;
+      prev.x = e.touches[0].clientX;
+      prev.y = e.touches[0].clientY;
+    }
+  }, { passive: false });
+  canvas.addEventListener('touchmove', (e) => {
+    if (!dragging || !img) return;
+    const t = e.touches[0];
+    const dx = (t.clientX - prev.x) * DPR;
+    const dy = (t.clientY - prev.y) * DPR;
+    offset.x += dx;
+    offset.y += dy;
+    prev.x = t.clientX;
+    prev.y = t.clientY;
+    draw();
+  }, { passive: false });
+  window.addEventListener('touchend', () => dragging = false);
+
+  // wheel zoom
+  canvas.addEventListener('wheel', (e) => {
+    if (!img) return;
+    e.preventDefault();
+    const delta = -e.deltaY;
+    const factor = Math.exp(delta * 0.001); // smooth zoom
+    zoomAtPoint(factor, e.offsetX * DPR, e.offsetY * DPR);
+  }, { passive: false });
+
+  function zoomAtPoint(factor, zx, zy) {
+    const preX = (zx - offset.x) / scale;
+    const preY = (zy - offset.y) / scale;
+    scale = clamp(scale * factor, 0.1, 10);
+    offset.x = zx - preX * scale;
+    offset.y = zy - preY * scale;
+    zoomInput.value = String(scale);
+    draw();
+  }
+
+  zoomInput.addEventListener('input', () => {
+    if (!img) return;
+    const newScale = clamp(parseFloat(zoomInput.value || '1'), 0.1, 10);
+    // Zoom towards center
+    zoomAtPoint(newScale / scale, canvas.width/2, canvas.height/2);
+  });
+
+  fileInput.addEventListener('change', () => {
+    const f = fileInput.files && fileInput.files[0];
+    loadFile(f);
+  });
+
+  function exportCroppedPNG() {
+    if (!img) return null;
+    const mm = parseFloat(diamInput.value || '20');
+    const inches = mmToIn(mm);
+    // 300 dpi target, clamp to [128, 4096]
+    const px = Math.round(clamp(inches * 300, 128, 4096));
+
+    const out = document.createElement('canvas');
+    out.width = px;
+    out.height = px;
+    const octx = out.getContext('2d');
+    octx.clearRect(0,0,px,px);
+
+    // Draw circular clip
+    octx.save();
+    octx.beginPath();
+    octx.arc(px/2, px/2, px/2, 0, Math.PI*2);
+    octx.clip();
+
+    // Map output canvas to current viewport circle
+    const radius = Math.min(canvas.width, canvas.height) * 0.45;
+    const cx = canvas.width/2, cy = canvas.height/2;
+
+    // Compute where the viewport circle maps from source image
+    // For each output pixel, we want to sample corresponding point in src image.
+    // We can compute transform: output unit square [-1..1] maps to viewport circle area.
+    // Simpler: draw the current image transform onto output using same transform scaled to px/radius.
+
+    const scaleFactor = (px / (2*radius)); // pixels per viewport unit
+    // Compose transform: start with output center, then translate so viewport circle center maps to output center,
+    // and scale accordingly.
+    octx.setTransform(scaleFactor, 0, 0, scaleFactor, px/2 - scaleFactor*cx, px/2 - scaleFactor*cy);
+    // Now draw the same as viewport (image with scale+offset)
+    octx.imageSmoothingQuality = 'high';
+    octx.drawImage(img, offset.x, offset.y, img.naturalWidth * scale, img.naturalHeight * scale);
+    octx.restore();
+
+    // Ensure transparent outside circle (already clipped); export
+    return out.toDataURL('image/png');
+  }
+
+  form.addEventListener('submit', (e) => {
+    if (!img) { e.preventDefault(); return; }
+    const dataURL = exportCroppedPNG();
+    if (!dataURL) { e.preventDefault(); return; }
+    imageDataField.value = dataURL;
+    diameterField.value = diamInput.value;
+  });
+
+  // initial draw
+  draw();
+})();
+</script>
+</body>
+</html>
